@@ -1,17 +1,17 @@
 import pandas as pd
-import os
 import re
+import time
 from pathlib import Path
 from openpyxl.worksheet.worksheet import Worksheet
 from openpyxl.styles import Alignment
+from openpyxl import load_workbook
+from watchdog.events import FileSystemEventHandler
+from watchdog.observers import Observer
 
 BASE_DIR = Path(__file__).resolve().parent
 FOLDER_PATH = BASE_DIR / "Gmail"  
 OUTPUT_FILE = BASE_DIR / "report.xlsx"
-
-COL_INDEX = 'Наименование'
-COL_VALUES_PURCHASE = 'Стоимость покупок с НДС\n\n(стр. 170)'
-COL_VALUES_SALE = ['в руб. и коп.\n\n(стр. 160)', '20%\n\n(стр. 170)', '20%\n\n(стр. 200)']
+TEMPLATE_FILE = BASE_DIR / "template.xlsx"
 
 def extract_quarter(filename: str) -> str:
     quarter = re.search(r'\d квартал \d{4}', filename)
@@ -29,24 +29,9 @@ def clean_df(df: pd.DataFrame) -> pd.DataFrame:
     '''Функция чистит лишние столбцы и строки'''
     cols = [col for col in df.columns if df[col].nunique(dropna=False) <= 1]
     df = df.drop(columns=cols)
-    for name in df.keys():
-        if 'Код вида операции' in name:
-            df = df[df[name] != 21]
-    return df
-
-def format_ws(ws: Worksheet) -> None:
-    '''Процедура форматирует таблицу (расширяет колонки для читаемости)'''
-    for col in ws.columns:
-        top_cell = col[0]
-        col_letter = top_cell.column_letter
-        max_len = max([len(str(cell.value or '')) for cell in col[1:]])
-        top_cell.value = top_cell.value.replace('\n\n', ' ')
-        if len(top_cell.value) - max_len > 20:
-            max_len = len(top_cell.value)
-        ws.column_dimensions[col_letter].width = max_len + 3
-        top_cell.alignment = Alignment(horizontal='center', wrap_text=True)
 
 def main():
+    template_book = load_workbook(TEMPLATE_FILE)
     purchase_files = []
     sale_files = []
 
@@ -63,32 +48,49 @@ def main():
     purchase_df = pd.concat(purchase_files, ignore_index=True).dropna(axis='columns', how='all') if purchase_files else pd.DataFrame()
     sale_df = pd.concat(sale_files, ignore_index=True).dropna(axis='columns', how='all') if sale_files else pd.DataFrame()
 
-    pivot_purchases = pd.DataFrame()
-    if not purchase_df.empty and COL_VALUES_PURCHASE in purchase_df.columns:
-        pivot_purchases = purchase_df.pivot_table(
-            values=COL_VALUES_PURCHASE, index=COL_INDEX, aggfunc='sum'
-        ).reset_index()
+    with pd.ExcelWriter(TEMPLATE_FILE, engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:
+        writer.workbook = template_book
+        
+        if not purchase_df.empty:
+            purchase_df.to_excel(writer, sheet_name='Покупки', index=False)
+        if not sale_df.empty:
+            sale_df.to_excel(writer, sheet_name='Продажи', index=False)
 
-    pivot_sales = pd.DataFrame()
-    if not sale_df.empty:
-        # Проверяем, все ли колонки для свода продаж присутствуют в файле
-        available_sale_vals = [col for col in COL_VALUES_SALE if col in sale_df.columns]
-        if available_sale_vals:
-            pivot_sales = sale_df.pivot_table(
-                values=available_sale_vals, index=COL_INDEX, aggfunc='sum'
-            ).reset_index()
-    relations = {'Покупки': clean_df(purchase_df) if not purchase_df.empty else purchase_df,
-                'Продажи': clean_df(sale_df) if not sale_df.empty else sale_df,
-                'Свод покупок': pivot_purchases,
-                'Свод продаж': pivot_sales}
+    template_book.save(OUTPUT_FILE)
 
-    with pd.ExcelWriter(OUTPUT_FILE, engine='openpyxl') as writer:
-        for sheet_name, table in relations.items():
-            if table.empty:
-                continue
-                
-            table.to_excel(writer, sheet_name=sheet_name, index=False)
-            format_ws(writer.sheets[sheet_name])
+class ExcelFolderHandler(FileSystemEventHandler):
+    """Класс, который ждет изменений в папке"""
+    def __init__(self):
+        super().__init__()
+        self.last_run = 0
+
+    def on_created(self, event):    
+        '''Метод, срабатывающий при появлении файла excel'''
+        if not event.is_directory and event.src_path.endswith('.xlsx') and not '~$' in event.src_path:
+            print('Заметил файл')
+            current_time = time.time()
+            if current_time - self.last_run > 2:
+
+                time.sleep(0.5)
+
+                try:
+                    main()
+                    self.last_run = time.time()
+                except Exception as e:
+                    print(f'{e}')
 
 if __name__ == '__main__':
     main()
+
+    event_handler = ExcelFolderHandler()
+    observer = Observer()
+    observer.schedule(event_handler, path = str(FOLDER_PATH), recursive=False)
+    observer.start()
+    print('Слежу за папкой')
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        observer.stop()
+    observer.join()
